@@ -38,45 +38,92 @@ export function detectAntigravityInstall() {
   return null;
 }
 
-export function extractOAuthCredentials(lsPath) {
+export async function extractOAuthCredentials(lsPath) {
   if (!lsPath || !fs.existsSync(lsPath)) return null;
   try {
     const buf = fs.readFileSync(lsPath);
     const content = buf.toString('latin1');
 
-    let clientId = '';
-    let clientSecret = '';
+    // Google OAuth Client IDs always start with digits (Google Cloud project number):
+    const idMatches = [...new Set(content.match(/\d+-[a-z0-9_-]+\.apps\.googleusercontent\.com/gi) || [])];
+    const secretMatches = [...new Set(content.match(/GOCSPX-[A-Za-z0-9_-]{28}/g) || [])];
 
-    // Scan for potential updated client IDs in binary
-    const idMatches = content.match(/[\w\-]+\.apps\.googleusercontent\.com/g) || [];
-    for (const match of idMatches) {
-      if (match.includes('googleusercontent.com')) {
-        clientId = match;
-        break;
+    if (idMatches.length === 0 || secretMatches.length === 0) return null;
+
+    // Check if we can determine the exact client ID from active Windows credential
+    let preferredId = null;
+    let sampleRefreshToken = null;
+    if (process.platform === 'win32') {
+      try {
+        const psScript = path.join(ROOT_DIR, 'scripts', 'wincred.ps1');
+        if (fs.existsSync(psScript)) {
+          const raw = execFileSync('powershell.exe', [
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', psScript,
+            '-Action', 'read',
+            '-Target', 'gemini:antigravity'
+          ], { encoding: 'utf8', timeout: 5000 }).trim();
+          if (raw) {
+            let doc = raw.startsWith('go-keyring-base64:')
+              ? JSON.parse(Buffer.from(raw.slice('go-keyring-base64:'.length), 'base64').toString('utf8'))
+              : JSON.parse(raw);
+            if (doc?.id_token) {
+              const payload = JSON.parse(Buffer.from(doc.id_token.split('.')[1], 'base64url').toString('utf8'));
+              preferredId = payload.azp || payload.aud;
+            }
+            if (doc?.token?.refresh_token) {
+              sampleRefreshToken = doc.token.refresh_token;
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // Default to the known Antigravity client if no preferredId found
+    if (!preferredId && idMatches.some(id => id.includes('1071006060591'))) {
+      preferredId = idMatches.find(id => id.includes('1071006060591'));
+    }
+
+    // Prioritize preferredId
+    idMatches.sort((a, b) => (a === preferredId ? -1 : b === preferredId ? 1 : 0));
+
+    // Test pairs against Google's token endpoint to confirm valid pairing
+    for (const id of idMatches) {
+      for (const secret of secretMatches) {
+        try {
+          const body = new URLSearchParams({
+            client_id: id,
+            client_secret: secret,
+            grant_type: 'refresh_token',
+            refresh_token: sampleRefreshToken || 'dummy_test_token'
+          });
+          const res = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: body
+          });
+          const data = await res.json();
+          // If 200 (real token succeeded) or 400 invalid_grant (dummy token validated pair), it's a valid pair!
+          if (res.status === 200 || (res.status === 400 && data.error === 'invalid_grant')) {
+            return { clientId: id, clientSecret: secret };
+          }
+        } catch {}
       }
     }
-    if (!clientId && idMatches.length > 0) {
-      clientId = idMatches[0];
-    }
 
-    // Scan for potential updated client secrets (GOCSPX-...)
-    // Google OAuth client secrets start with GOCSPX- followed by exactly 28 characters
-    const secretMatches = content.match(/GOCSPX-[A-Za-z0-9_-]{28}/g) || [];
-    if (secretMatches.length > 0) {
-      clientSecret = secretMatches[0].slice(0, 35);
-    }
-
-    if (clientId && clientSecret) {
-      return { clientId, clientSecret };
-    }
-    return null;
+    // Fallback if network validation failed
+    return {
+      clientId: idMatches[0],
+      clientSecret: secretMatches[0].slice(0, 35)
+    };
   } catch (err) {
     log(`Could not read binary for OAuth credentials: ${err.message}`, 'warn');
     return null;
   }
 }
 
-export function ensureOAuthConfigFile(lsPath) {
+export async function ensureOAuthConfigFile(lsPath) {
   const oauthFile = path.join(ROOT_DIR, 'oauth-client.json');
   let current = null;
   if (fs.existsSync(oauthFile)) {
@@ -85,10 +132,18 @@ export function ensureOAuthConfigFile(lsPath) {
     } catch {}
   }
 
-  const isCorrupted = current && current.client_secret && (current.client_secret.endsWith('GOCSPX-') || current.client_secret.length > 35);
-  const isDummy = !current || !current.client_id || current.client_id.includes('YOUR_CLIENT_ID') || !current.client_secret || isCorrupted;
+  const isCorrupted = current && (
+    !current.client_id ||
+    !/^\d+-[a-z0-9_-]+\.apps\.googleusercontent\.com$/i.test(String(current.client_id).trim()) ||
+    !current.client_secret ||
+    current.client_secret.endsWith('GOCSPX-') ||
+    current.client_secret.length > 35
+  );
+  // Also re-sync if the client ID was using the wrong client (884354919052) instead of the Antigravity client
+  const isWrongClient = current && current.client_id && current.client_id.includes('884354919052');
+  const isDummy = !current || !current.client_id || current.client_id.includes('YOUR_CLIENT_ID') || !current.client_secret || isCorrupted || isWrongClient;
   if (isDummy) {
-    const extracted = extractOAuthCredentials(lsPath);
+    const extracted = await extractOAuthCredentials(lsPath);
     if (extracted && extracted.clientId && extracted.clientSecret) {
       fs.writeFileSync(oauthFile, JSON.stringify({
         client_id: extracted.clientId,
@@ -201,10 +256,10 @@ export async function runSetup() {
   const install = detectAntigravityInstall();
   if (install) {
     log(`Found Antigravity: ${install.root}`, 'success');
-    ensureOAuthConfigFile(install.ls);
+    await ensureOAuthConfigFile(install.ls);
   } else {
     log('Antigravity installation directory not found in standard paths. Using built-in credentials.', 'warn');
-    ensureOAuthConfigFile(null);
+    await ensureOAuthConfigFile(null);
   }
 
   importCurrentAntigravityAccount();

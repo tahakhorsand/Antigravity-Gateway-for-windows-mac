@@ -9,22 +9,33 @@ const __dirname = path.dirname(__filename);
 // set GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET, or create oauth-client.json
 // (see oauth-client.example.json).
 function loadOAuthClient() {
+  let clientId = '';
+  let clientSecret = '';
+
   if (process.env.GOOGLE_OAUTH_CLIENT_ID && process.env.GOOGLE_OAUTH_CLIENT_SECRET) {
-    return { 
-      clientId: process.env.GOOGLE_OAUTH_CLIENT_ID.trim(), 
-      clientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET.trim() 
-    };
+    clientId = process.env.GOOGLE_OAUTH_CLIENT_ID.trim();
+    clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET.trim();
+  } else {
+    const file = path.resolve(__dirname, '../oauth-client.json');
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (data.client_id && data.client_secret) {
+        clientId = String(data.client_id).trim();
+        clientSecret = String(data.client_secret).trim();
+      }
+    } catch { /* fall through */ }
   }
-  const file = path.resolve(__dirname, '../oauth-client.json');
-  try {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (data.client_id && data.client_secret) {
-      return { 
-        clientId: String(data.client_id).trim(), 
-        clientSecret: String(data.client_secret).trim() 
-      };
-    }
-  } catch { /* fall through */ }
+
+  // Ensure client_id starts with the numeric project ID digits and ends with .apps.googleusercontent.com
+  const match = clientId.match(/\d+-[a-z0-9_-]+\.apps\.googleusercontent\.com/i);
+  if (match) {
+    clientId = match[0];
+  }
+
+  if (clientId && clientSecret) {
+    return { clientId, clientSecret };
+  }
+
   console.error('❌ Missing OAuth client: create oauth-client.json (see oauth-client.example.json) or set GOOGLE_OAUTH_CLIENT_ID/SECRET.');
   return { clientId: '', clientSecret: '' };
 }

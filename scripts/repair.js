@@ -78,7 +78,7 @@ export async function runRepair() {
       
       // Step 2: Re-extract OAuth credentials in case binary changed
       log('Step 2: Checking for updated OAuth credentials in binary...', 'info');
-      const extracted = extractOAuthCredentials(install.ls);
+      const extracted = await extractOAuthCredentials(install.ls);
       if (extracted) {
         const oauthFile = path.join(ROOT_DIR, 'oauth-client.json');
         fs.writeFileSync(oauthFile, JSON.stringify({
